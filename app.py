@@ -1,18 +1,28 @@
 import time, math, requests, pandas as pd, numpy as np, streamlit as st, plotly.express as px
 
-# Free, no-key source
+# CoinCap (requires Bearer token). Put COINCAP_API_KEY in Streamlit Secrets.
 API_BASE = "https://api.coincap.io/v2"
 STABLE_SYMS = {"USDT","USDC","DAI","FDUSD","TUSD","USDe","USDL","USDP","PYUSD","GUSD","FRAX","LUSD","USDD","USDX"}
 
-st.set_page_config(page_title="Crypto Correlations (Free)", layout="wide")
+st.set_page_config(page_title="Crypto Correlations (Free, CoinCap)", layout="wide")
+
+# Ensure the key exists
+if "COINCAP_API_KEY" not in st.secrets or not st.secrets["COINCAP_API_KEY"]:
+    st.error("Missing COINCAP_API_KEY in Streamlit Secrets. Add it under Manage app → Settings → Secrets.")
+    st.stop()
+
+HEADERS = {
+    "Authorization": f"Bearer {st.secrets['COINCAP_API_KEY']}",
+    "Accept-Encoding": "gzip",
+    "User-Agent": "streamlit-crypto-corr/1.0"
+}
 
 @st.cache_data(show_spinner=False, ttl=60*60*12)
 def fetch_top100():
-    # CoinCap: /assets returns ranked assets
-    r = requests.get(f"{API_BASE}/assets", params={"limit": 200}, timeout=60)
+    # Ranked assets; we ask for 200 and then filter out stables, taking first 100 non-stables.
+    r = requests.get(f"{API_BASE}/assets", params={"limit": 200}, headers=HEADERS, timeout=60)
     r.raise_for_status()
     rows = r.json().get("data", [])
-    # sort by rank and drop stables
     rows = [x for x in rows if x.get("rank")]
     rows.sort(key=lambda x: int(x["rank"]))
     ids, symbols = [], []
@@ -21,8 +31,8 @@ def fetch_top100():
         name = str(row.get("name","")).lower()
         if sym in STABLE_SYMS or "stable" in name:
             continue
-        ids.append(row["id"])          # e.g., "bitcoin"
-        symbols.append(sym)            # e.g., "BTC"
+        ids.append(row["id"])   # e.g., "bitcoin"
+        symbols.append(sym)     # e.g., "BTC"
         if len(ids) == 100:
             break
     return ids, symbols
@@ -34,6 +44,7 @@ def fetch_hist_daily(asset_id: str, start_days: int = 365) -> pd.Series | None:
     r = requests.get(
         f"{API_BASE}/assets/{asset_id}/history",
         params={"interval": "d1", "start": start_ms, "end": end_ms},
+        headers=HEADERS,
         timeout=60,
     )
     r.raise_for_status()
@@ -41,7 +52,6 @@ def fetch_hist_daily(asset_id: str, start_days: int = 365) -> pd.Series | None:
     if not arr:
         return None
     df = pd.DataFrame(arr)
-    # CoinCap returns 'time' (ms) and 'priceUsd' (string)
     df["ts"] = pd.to_datetime(df["time"], unit="ms", utc=True)
     s = pd.to_numeric(df["priceUsd"], errors="coerce")
     s = pd.Series(s.values, index=df["ts"]).asfreq("D").ffill()
@@ -76,7 +86,7 @@ with st.sidebar:
         fetch_hist_daily.clear()
         st.success("Cache cleared. Data will refetch.")
 
-st.caption("Data source: CoinCap (free). Daily prices; correlations are Pearson on log-returns. Volatility = rolling realized σ (annualized).")
+st.caption("Data source: CoinCap (API key). Daily prices; correlations are Pearson on log-returns. Volatility = rolling realized σ (annualized).")
 
 ids, symbols = fetch_top100()
 st.write(f"Universe: {len(ids)} assets (top-ranked, stables excluded).")
@@ -88,7 +98,7 @@ for i, cid in enumerate(ids):
     if s is not None:
         series[cid] = s
     progress.progress((i+1)/len(ids))
-    time.sleep(0.2)  # polite to the free API
+    time.sleep(0.15)  # polite to the API, still fast enough
 
 if not series:
     st.error("No price series fetched. Try again later.")
