@@ -142,18 +142,19 @@ rv = rets.rolling(int(vol_roll)).std() * ann
 corr_price = rets.tail(win).corr()
 corr_vol   = rv.tail(win).corr()
 
+st.write(f"Corr shapes → price: {corr_price.shape}, vol: {corr_vol.shape}")
 col1, col2 = st.columns(2)
 with col1:
     st.subheader(f"Price correlation — last {corr_window}")
     fig = px.imshow(corr_price, zmin=-1, zmax=1, color_continuous_scale="RdBu", aspect="auto")
-    st.plotly_chart(fig, width="stretch", key="price_corr_chart")
+    st.plotly_chart(fig, use_container_width=True, key="price_corr_chart")
     tp = top_pairs(corr_price, k=topn)
     st.dataframe(tp, use_container_width=True)
     st.download_button("Download corr (price) CSV", corr_price.to_csv().encode(), file_name="corr_price.csv", mime="text/csv")
 with col2:
     st.subheader(f"Volatility correlation — last {corr_window} (σ roll {vol_roll}d)")
     fig2 = px.imshow(corr_vol, zmin=-1, zmax=1, color_continuous_scale="RdBu", aspect="auto")
-    st.plotly_chart(fig2, width="stretch", key="vol_corr_chart")
+    st.plotly_chart(fig2, use_container_width=True, key="vol_corr_chart")
     tpv = top_pairs(corr_vol, k=topn)
     st.dataframe(tpv, use_container_width=True)
     st.download_button("Download corr (vol) CSV", corr_vol.to_csv().encode(), file_name="corr_vol.csv", mime="text/csv")
