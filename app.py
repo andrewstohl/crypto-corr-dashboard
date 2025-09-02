@@ -1,40 +1,51 @@
 import time, math, requests, pandas as pd, numpy as np, streamlit as st, plotly.express as px
 
-API_BASE = "https://api.coinpaprika.com/v1"
+# Free, no-key source
+API_BASE = "https://api.coincap.io/v2"
 STABLE_SYMS = {"USDT","USDC","DAI","FDUSD","TUSD","USDe","USDL","USDP","PYUSD","GUSD","FRAX","LUSD","USDD","USDX"}
 
 st.set_page_config(page_title="Crypto Correlations (Free)", layout="wide")
 
 @st.cache_data(show_spinner=False, ttl=60*60*12)
 def fetch_top100():
-    r = requests.get(f"{API_BASE}/tickers", params={"quotes":"USD"}, timeout=60)
+    # CoinCap: /assets returns ranked assets
+    r = requests.get(f"{API_BASE}/assets", params={"limit": 200}, timeout=60)
     r.raise_for_status()
-    rows = [x for x in r.json() if x.get("rank", 0) > 0]
-    rows.sort(key=lambda x: x["rank"])
+    rows = r.json().get("data", [])
+    # sort by rank and drop stables
+    rows = [x for x in rows if x.get("rank")]
+    rows.sort(key=lambda x: int(x["rank"]))
     ids, symbols = [], []
     for row in rows:
         sym = str(row.get("symbol","")).upper()
         name = str(row.get("name","")).lower()
         if sym in STABLE_SYMS or "stable" in name:
             continue
-        ids.append(row["id"]); symbols.append(sym)
-        if len(ids) == 100: break
+        ids.append(row["id"])          # e.g., "bitcoin"
+        symbols.append(sym)            # e.g., "BTC"
+        if len(ids) == 100:
+            break
     return ids, symbols
 
 @st.cache_data(show_spinner=False, ttl=60*60*12)
-def fetch_hist_daily(coin_id: str, start_days: int = 365) -> pd.Series | None:
-    start = (pd.Timestamp.utcnow() - pd.Timedelta(days=start_days)).strftime("%Y-%m-%d")
-    r = requests.get(f"{API_BASE}/tickers/{coin_id}/historical",
-                     params={"start": start, "interval": "1d", "quote": "usd"},
-                     timeout=60)
+def fetch_hist_daily(asset_id: str, start_days: int = 365) -> pd.Series | None:
+    end_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+    start_ms = int((pd.Timestamp.utcnow() - pd.Timedelta(days=start_days)).timestamp() * 1000)
+    r = requests.get(
+        f"{API_BASE}/assets/{asset_id}/history",
+        params={"interval": "d1", "start": start_ms, "end": end_ms},
+        timeout=60,
+    )
     r.raise_for_status()
-    arr = r.json()
+    arr = r.json().get("data", [])
     if not arr:
         return None
     df = pd.DataFrame(arr)
-    df["ts"] = pd.to_datetime(df["timestamp"], utc=True)
-    s = df.set_index("ts")["price"].asfreq("D").ffill()
-    s.name = coin_id
+    # CoinCap returns 'time' (ms) and 'priceUsd' (string)
+    df["ts"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+    s = pd.to_numeric(df["priceUsd"], errors="coerce")
+    s = pd.Series(s.values, index=df["ts"]).asfreq("D").ffill()
+    s.name = asset_id
     return s
 
 def winsorize(series: pd.Series, q=0.005) -> pd.Series:
@@ -65,7 +76,7 @@ with st.sidebar:
         fetch_hist_daily.clear()
         st.success("Cache cleared. Data will refetch.")
 
-st.caption("Data source: CoinPaprika (free). Daily prices; correlations are Pearson on log-returns. Volatility = rolling realized σ (annualized).")
+st.caption("Data source: CoinCap (free). Daily prices; correlations are Pearson on log-returns. Volatility = rolling realized σ (annualized).")
 
 ids, symbols = fetch_top100()
 st.write(f"Universe: {len(ids)} assets (top-ranked, stables excluded).")
@@ -77,7 +88,7 @@ for i, cid in enumerate(ids):
     if s is not None:
         series[cid] = s
     progress.progress((i+1)/len(ids))
-    time.sleep(0.25)  # polite for the free API
+    time.sleep(0.2)  # polite to the free API
 
 if not series:
     st.error("No price series fetched. Try again later.")
