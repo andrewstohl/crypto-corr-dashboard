@@ -1,28 +1,34 @@
 import time, math, requests, pandas as pd, numpy as np, streamlit as st, plotly.express as px
 
-# CoinCap (requires Bearer token). Put COINCAP_API_KEY in Streamlit Secrets.
-API_BASE = "https://api.coincap.io/v2"
+# Use CoinCap v3 base; keep key in Streamlit Secrets only.
+API_BASE = "https://rest.coincap.io/v3"
 STABLE_SYMS = {"USDT","USDC","DAI","FDUSD","TUSD","USDe","USDL","USDP","PYUSD","GUSD","FRAX","LUSD","USDD","USDX"}
 
-st.set_page_config(page_title="Crypto Correlations (Free, CoinCap)", layout="wide")
+st.set_page_config(page_title="Crypto Correlations (CoinCap v3)", layout="wide")
 
-# Ensure the key exists
+# Require key
 if "COINCAP_API_KEY" not in st.secrets or not st.secrets["COINCAP_API_KEY"]:
     st.error("Missing COINCAP_API_KEY in Streamlit Secrets. Add it under Manage app → Settings → Secrets.")
     st.stop()
 
+API_KEY = st.secrets["COINCAP_API_KEY"]
 HEADERS = {
-    "Authorization": f"Bearer {st.secrets['COINCAP_API_KEY']}",
+    "Authorization": f"Bearer {API_KEY}",
     "Accept-Encoding": "gzip",
     "User-Agent": "streamlit-crypto-corr/1.0"
 }
 
 @st.cache_data(show_spinner=False, ttl=60*60*12)
 def fetch_top100():
-    # Ranked assets; we ask for 200 and then filter out stables, taking first 100 non-stables.
-    r = requests.get(f"{API_BASE}/assets", params={"limit": 200}, headers=HEADERS, timeout=60)
+    # Ask for 200, then filter out stables and take first 100
+    r = requests.get(
+        f"{API_BASE}/assets",
+        params={"limit": 200, "apiKey": API_KEY},
+        headers=HEADERS,
+        timeout=60
+    )
     r.raise_for_status()
-    rows = r.json().get("data", [])
+    rows = r.json().get("data", []) or []
     rows = [x for x in rows if x.get("rank")]
     rows.sort(key=lambda x: int(x["rank"]))
     ids, symbols = [], []
@@ -43,7 +49,7 @@ def fetch_hist_daily(asset_id: str, start_days: int = 365) -> pd.Series | None:
     start_ms = int((pd.Timestamp.utcnow() - pd.Timedelta(days=start_days)).timestamp() * 1000)
     r = requests.get(
         f"{API_BASE}/assets/{asset_id}/history",
-        params={"interval": "d1", "start": start_ms, "end": end_ms},
+        params={"interval": "d1", "start": start_ms, "end": end_ms, "apiKey": API_KEY},
         headers=HEADERS,
         timeout=60,
     )
@@ -52,6 +58,7 @@ def fetch_hist_daily(asset_id: str, start_days: int = 365) -> pd.Series | None:
     if not arr:
         return None
     df = pd.DataFrame(arr)
+    # v3 returns 'time' (ms) and 'priceUsd' as string
     df["ts"] = pd.to_datetime(df["time"], unit="ms", utc=True)
     s = pd.to_numeric(df["priceUsd"], errors="coerce")
     s = pd.Series(s.values, index=df["ts"]).asfreq("D").ffill()
@@ -63,8 +70,7 @@ def winsorize(series: pd.Series, q=0.005) -> pd.Series:
     return series.clip(lower=lo, upper=hi)
 
 def top_pairs(C: pd.DataFrame, k: int = 30) -> pd.DataFrame:
-    cols = list(C.columns)
-    out = []
+    cols = list(C.columns); out = []
     for i, a in enumerate(cols):
         for j in range(i+1, len(cols)):
             rho = float(C.iat[i, j])
@@ -86,7 +92,7 @@ with st.sidebar:
         fetch_hist_daily.clear()
         st.success("Cache cleared. Data will refetch.")
 
-st.caption("Data source: CoinCap (API key). Daily prices; correlations are Pearson on log-returns. Volatility = rolling realized σ (annualized).")
+st.caption("Data: CoinCap v3 (with API key). Daily prices; correlations are Pearson on log-returns. Volatility = rolling realized σ (annualized).")
 
 ids, symbols = fetch_top100()
 st.write(f"Universe: {len(ids)} assets (top-ranked, stables excluded).")
@@ -98,7 +104,7 @@ for i, cid in enumerate(ids):
     if s is not None:
         series[cid] = s
     progress.progress((i+1)/len(ids))
-    time.sleep(0.15)  # polite to the API, still fast enough
+    time.sleep(0.15)
 
 if not series:
     st.error("No price series fetched. Try again later.")
@@ -117,13 +123,11 @@ if prices.shape[1] < 3:
     st.warning("Too few assets after coverage filter. Lower the threshold or widen the window.")
     st.stop()
 
-pct = prices.pct_change()
-pct = pct.apply(winsorize)
+pct = prices.pct_change().apply(winsorize)
 rets = np.log1p(pct).dropna(how="all")
 
 ann = math.sqrt(365)
-vol_window = int(vol_roll)
-rv = rets.rolling(vol_window).std() * ann
+rv = rets.rolling(int(vol_roll)).std() * ann
 
 corr_price = rets.tail(win).corr()
 corr_vol   = rv.tail(win).corr()
@@ -137,11 +141,11 @@ with col1:
     st.dataframe(tp, use_container_width=True)
     st.download_button("Download corr (price) CSV", corr_price.to_csv().encode(), file_name="corr_price.csv", mime="text/csv")
 with col2:
-    st.subheader(f"Volatility correlation — last {corr_window} (σ roll {vol_window}d)")
+    st.subheader(f"Volatility correlation — last {corr_window} (σ roll {vol_roll}d)")
     fig2 = px.imshow(corr_vol, zmin=-1, zmax=1, color_continuous_scale="RdBu", aspect="auto")
     st.plotly_chart(fig2, use_container_width=True)
     tpv = top_pairs(corr_vol, k=topn)
     st.dataframe(tpv, use_container_width=True)
     st.download_button("Download corr (vol) CSV", corr_vol.to_csv().encode(), file_name="corr_vol.csv", mime="text/csv")
 
-st.caption("Tip: 7D reacts fastest; 30D is a good baseline; 90D sanity-checks stability. High price-corr + high absolute vol is usually best for LPs with lower IL.")
+st.caption("Tip: 7D reacts fastest; 30D is a good baseline; 90D checks stability.")
