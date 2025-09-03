@@ -1,12 +1,13 @@
-# app.py — VORA Price & Volatility Correlations (CoinGecko, 90d hourly)
-# - Token Focus only (no heatmaps)
+# app.py — VORA Price & Volatility Correlations (CoinGecko, corrected)
+# - Token Focus only
 # - Universe up to 250 (top by market cap; stables excluded)
-# - History: 90 days, hourly (CoinGecko returns hourly when days<=90 and interval omitted)
-# - Lookbacks: 7/14/30/60/90 (default 30D)
-# - Overlap requirement: >=90% of window for both price & vol correlations
+# - 365d history (daily)
+# - Lookbacks: 7/14/30/90 (default 14D)
+# - Overlap requirement: >=85% of window for both price & vol correlations
 # - No forward-fill before returns (prevents fake correlations)
 # - Unique internal columns as SYM|coingecko_id to prevent symbol collisions
-# - Vol window: 24h (24 hourly points)
+# - Vol window fixed at 30d; correlations evaluated on the chosen lookback window
+# - Minimal clipping (only if window >=30d), applied in-window, not on full history
 # - Compact error logging
 
 import time
@@ -20,18 +21,18 @@ import streamlit as st
 st.set_page_config(page_title="VORA Price & Volatility Correlations", layout="wide")
 st.markdown("""
 <style>
-/* Reduce top whitespace and tighten title */
+/* Tidy top spacing + smaller title */
 header[data-testid="stHeader"] { height: auto; }
-div.block-container { padding-top: 0.8rem; }
-h1 { color:#E5E7EB; font-size:1.10rem; margin:0.25rem 0 0.6rem 0; }
+div.block-container { padding-top: 1.0rem; }
+h1 { color:#0b1220; font-size:1.15rem; margin:0.35rem 0 0.5rem 0; }
 
-/* Sidebar — ensure sliders don’t clip on the right; slightly narrow slider track */
+/* Sidebar — ensure sliders don’t clip on the right; narrow the internal slider width a bit */
 section[data-testid="stSidebar"] { min-width: 360px; }
 section[data-testid="stSidebar"] .block-container { padding-right: 18px; }
 section[data-testid="stSidebar"] [data-baseweb="slider"] { margin-right: 10px; }
 section[data-testid="stSidebar"] [data-baseweb="slider"] > div { max-width: 94%; }
 
-/* Compact dataframes */
+/* Dataframe font slightly compact */
 div[data-testid="stDataFrame"] table { font-size: 0.92rem; }
 </style>
 """, unsafe_allow_html=True)
@@ -93,7 +94,7 @@ def http_get(path: str, params=None, timeout=30, retries=3, backoff=2.0):
                 continue
             last = f"{r.status_code}"
         except requests.RequestException as e:
-            last = f"EXC {str(e)[:120]}"
+            last = f"EXC {str(e)[:100]}"
         time.sleep(0.10)
     log_err(f"GET {path} failed ({last})")
     return None
@@ -134,39 +135,40 @@ def fetch_universe_top_n(top_n=100):
             break
     return ids, syms, pd.DataFrame(rows)
 
-# -------------------- Hourly history (90 days), NO ffill --------------------
+# -------------------- History (365 days daily, fixed; NO ffill) --------------------
 @st.cache_data(show_spinner=False, ttl=60*60*12)
-def fetch_hist_series_hourly(coin_id: str, days: int = 90) -> pd.Series | None:
-    # Leave interval empty → hourly granularity for 2–90d per CoinGecko behavior
-    r = http_get(f"/coins/{coin_id}/market_chart",
-                 params={"vs_currency": "usd", "days": days},
-                 timeout=35, retries=3)
+def fetch_hist_daily_series(coin_id: str) -> pd.Series | None:
+    r = http_get(f"/coins/{coin_id}/market_chart", params={
+        "vs_currency": "usd",
+        "days": 365,
+        "interval": "daily"
+    }, timeout=35, retries=3)
     if not r:
         return None
     data = r.json()
-    pts = data.get("prices") or []
-    if not pts:
+    prices = data.get("prices") or []
+    if not prices:
         log_err(f"no-prices:{coin_id}")
         return None
-
-    df = pd.DataFrame(pts, columns=["ts_ms", "price"])
-    ts = pd.to_datetime(df["ts_ms"], unit="ms", utc=True).dt.tz_convert(None).dt.floor("H")
+    df = pd.DataFrame(prices, columns=["ts_ms", "price"])
+    ts = pd.to_datetime(df["ts_ms"], unit="ms", utc=True).dt.tz_convert(None)
     s = pd.Series(pd.to_numeric(df["price"], errors="coerce").astype(float).values, index=ts)
     s = s[~s.index.duplicated(keep="last")].sort_index()
-    s = s[s > 0]
-    if len(s) < 30:
+    daily = s.resample("D").last()           # <-- no forward-fill here
+    daily = daily[daily > 0]
+    if len(daily) < 30:
         log_err(f"short:{coin_id}")
         return None
-    s.name = coin_id
-    return s
+    daily.name = coin_id
+    return daily
 
 # -------------------- Math --------------------
 def compute_returns(price_df: pd.DataFrame) -> pd.DataFrame:
+    # No clipping here; clipping (if any) will be applied in-window later
     return np.log(price_df).diff()
 
-def realized_vol(returns: pd.DataFrame, window: int = 24) -> pd.DataFrame:
-    # 24 = 24 hours (~1d); annualize with sqrt(365)
-    minp = max(8, window // 2)
+def realized_vol(returns: pd.DataFrame, window: int = 30) -> pd.DataFrame:
+    minp = max(2, window // 2)
     return returns.rolling(window, min_periods=minp).std() * np.sqrt(365)
 
 def pairwise_corr(df: pd.DataFrame, min_overlap: int) -> pd.DataFrame:
@@ -200,23 +202,23 @@ def focus_series(C: pd.DataFrame, colname: str) -> pd.Series:
 with st.sidebar:
     st.subheader("Settings")
 
-    # 1) Token focus — placeholder; we'll populate after we know the columns
+    # 1) Target token — we’ll populate options after data loads, but keep the slot here
     if "focus_token_symbol" not in st.session_state:
         st.session_state.focus_token_symbol = "ETH"
     focus_token_widget = st.empty()
 
-    # 2) Correlation lookback (default 30D)
-    opts = ["7D", "14D", "30D", "60D", "90D"]
+    # 2) Correlation lookback (default 14D)
+    opts = ["7D", "14D", "30D", "90D"]
     corr_win = st.selectbox("Correlation lookback", opts, index=opts.index("30D"), key="corr_win")
 
     # 3) Min correlation
-    min_corr = st.slider("Min correlation", 0.00, 1.00, 0.90, step=0.01)
+    min_corr = st.slider("Min correlation", 0.00, 1.00, 0.85, step=0.01)
 
     # 4) Max correlation
     max_corr = st.slider("Max correlation", 0.00, 1.00, 0.99, step=0.01)
 
     # 5) Universe size
-    top_n = st.slider("Universe size (by mkt cap)", 20, 250, 100, step=10)
+    top_n = st.slider("Universe size (by mkt cap)", 20, 250, 200, step=10)
 
     st.divider()
     if st.button("🔄 Clear cache & reload", type="primary"):
@@ -227,18 +229,18 @@ ids, syms, _raw = fetch_universe_top_n(top_n=top_n)
 if not ids:
     st.error("Failed to fetch universe."); st.stop()
 
-# Build internal column naming (avoid symbol collisions)
-# internal name = SYM|id ; display uses SYM
+# Build internal column naming (to avoid collisions)
+# internal name = SYM|id ; we’ll display SYM in UI/tables
 id2sym = dict(zip(ids, (s.upper() for s in syms)))
 internal_name = {cid: f"{id2sym[cid]}|{cid}" for cid in ids}  # e.g., ETH|ethereum
 
-# Fetch 90d hourly prices
-progress = st.progress(0.0, text="Loading 90d hourly prices …")
+# Fetch prices (365d)
+progress = st.progress(0.0, text="Loading 365d prices …")
 series = {}; fails = []
 for i, cid in enumerate(ids):
-    s = fetch_hist_series_hourly(cid, days=90)
+    s = fetch_hist_daily_series(cid)
     if s is not None:
-        s = s.rename(internal_name[cid])  # rename to internal col name
+        s = s.rename(internal_name[cid])  # rename series to internal col name
         series[cid] = s
     else:
         fails.append(cid)
@@ -253,60 +255,67 @@ if fails:
 if not series:
     st.error("No price series available. Try smaller universe."); st.stop()
 
-# Aligned hourly grid (NO forward-fill)
-all_hours = pd.date_range(
+# Aligned price matrix (NO forward-fill)
+all_dates = pd.date_range(
     start=min(s.index.min() for s in series.values()),
     end=max(s.index.max() for s in series.values()),
-    freq="H"
+    freq="D"
 )
-prices = pd.DataFrame({internal_name[cid]: s.reindex(all_hours) for cid, s in series.items()})
-prices = prices.replace([np.inf, -np.inf], np.nan).where(prices > 0)
+aligned = {internal_name[cid]: s.reindex(all_dates) for cid, s in series.items()}
+prices = pd.DataFrame(aligned).replace([np.inf, -np.inf], np.nan).where(lambda x: x > 0)
 
 # Sidebar token selector now that we know columns (by symbol list)
 with st.sidebar:
+    # Build a unique symbol list from our internal columns
     colnames = list(prices.columns)
     symbols = sorted({name.split("|", 1)[0] for name in colnames})
     default_sym = st.session_state.focus_token_symbol if st.session_state.focus_token_symbol in symbols else \
                   ("ETH" if "ETH" in symbols else symbols[0])
-    st.session_state.focus_token_symbol = focus_token_widget.selectbox(
-        "Token focus", options=symbols, index=symbols.index(default_sym)
-    )
+    st.session_state.focus_token_symbol = focus_token_widget.selectbox("Target token", options=symbols,
+                                                                       index=symbols.index(default_sym))
 focus_symbol = st.session_state.focus_token_symbol
 
-# Map from symbol -> internal column name (one per symbol in our universe)
+# Map from symbol -> internal column name (there’s exactly one per symbol in our universe)
 sym2col = {}
 for col in prices.columns:
     sym = col.split("|", 1)[0]
     if sym not in sym2col:
-        sym2col[sym] = col
+        sym2col[sym] = col  # first occurrence; we constructed universe with unique symbols
 focus_col = sym2col.get(focus_symbol)
 
 # Summary line
-st.write(f"Universe loaded: {prices.shape[1]} assets × {prices.shape[0]} hours of prices.")
+st.write(f"Universe loaded: {prices.shape[1]} assets × {prices.shape[0]} days of prices.")
 
-# -------------------- Window selection (end at actual last timestamp) --------------------
-LOOK_MAP = {"7D": 7, "14D": 14, "30D": 30, "60D": 60, "90D": 90}
+# -------------------- Window selection (end at actual last date) --------------------
+end_date = prices.index.max()                # align with “today” in the dataset
+LOOK_MAP = {"7D": 7, "14D": 14, "30D": 30, "90D": 90}
 wdays = LOOK_MAP[corr_win]
-end_ts = prices.index.max()
-start_ts = end_ts - pd.Timedelta(days=wdays)
+start_date = end_date - pd.Timedelta(days=wdays)
 
-# Coverage at end (info only)
+# coverage at end (informational only)
 coverage = prices.notna().mean(axis=1)
-cov_at_end = float(coverage.loc[end_ts]) if end_ts in coverage.index else np.nan
-st.caption(f"Window: {start_ts.strftime('%Y-%m-%d %H:%M')} → {end_ts.strftime('%Y-%m-%d %H:%M')}  •  coverage @ end: {cov_at_end:.1%}")
+cov_at_end = float(coverage.loc[end_date]) if end_date in coverage.index else np.nan
+st.caption(f"Window: {start_date.date()} → {end_date.date()}  •  coverage @ end (all assets): {cov_at_end:.1%}")
 
 # -------------------- Metrics & correlations --------------------
-ret_full = compute_returns(prices)                 # hourly log returns
-vol_full = realized_vol(ret_full, window=24)       # 24h rolling σ on hourly returns
+ret_full = compute_returns(prices)
+vol_full = realized_vol(ret_full, window=30)  # fixed 30d
 
-# Select lookback
-ret_w = ret_full.loc[start_ts:end_ts]
-vol_w = vol_full.loc[start_ts:end_ts]
+# Select the lookback window
+ret_w = ret_full.loc[start_date:end_date]
+vol_w = vol_full.loc[start_date:end_date]
 
-# Require >=90% overlap of the *hourly* window
-n_hours = int(wdays * 24)
-min_obs_price = max(12, int(round(0.90 * n_hours)))
-min_obs_vol   = max(24, int(round(0.90 * n_hours)))
+# Optional, light clipping IN-WINDOW ONLY (disable for short windows)
+if wdays >= 30:
+    for c in ret_w.columns:
+        x = ret_w[c].dropna()
+        if len(x) > 30:
+            lo, hi = x.quantile(0.005), x.quantile(0.995)  # 0.5–99.5%
+            ret_w[c] = ret_w[c].clip(lo, hi)
+
+# Require >=85% overlap inside the window
+min_obs_price = max(5, int(round(0.95 * wdays)))
+min_obs_vol   = max(10, int(round(0.95 * wdays)))  # volatility series count in-window
 
 ret_w = ret_w.loc[:, ret_w.count() >= min_obs_price]
 vol_w = vol_w.loc[:, vol_w.count() >= min_obs_vol]
@@ -318,9 +327,9 @@ C_vol   = pairwise_corr(vol_w, min_overlap=min_obs_vol)
 st.subheader(f"🎯 {focus_symbol} — Correlations")
 
 if focus_col is None or (C_price.empty and C_vol.empty):
-    st.info("Not enough data in-window for correlations. Try increasing lookback or reducing universe size.")
+    st.info("Not enough data in-window for correlations. Try increasing lookback or universe size.")
 else:
-    # Pull focus series (internal names)
+    # Individual series (internal names)
     s_price = focus_series(C_price, focus_col)
     s_vol   = focus_series(C_vol,   focus_col)
 
@@ -328,7 +337,8 @@ else:
     def to_symbol_index(s: pd.Series) -> pd.Series:
         s2 = s.copy()
         s2.index = [idx.split("|", 1)[0] for idx in s.index]
-        return s2.groupby(s2.index).max()  # collapse duplicates defensively
+        # collapse duplicates by taking max (shouldn’t happen given unique symbols, but safe)
+        return s2.groupby(s2.index).max()
 
     s_price_sym = to_symbol_index(s_price)
     s_vol_sym   = to_symbol_index(s_vol)
@@ -378,7 +388,7 @@ else:
             st.info("No tokens in the selected range for price correlation.")
 
     with col2:
-        st.markdown("**Volatility correlation (ρ of σ(24h))**")
+        st.markdown("**Volatility correlation (ρ of σ(30d))**")
         if not s_vol_f.empty:
             dfv = s_vol_f.rename("ρ").to_frame()
             st.dataframe(dfv.round(4), use_container_width=True)
@@ -398,4 +408,4 @@ if error_log:
             st.text(e)
 
 # Footer meta
-st.caption(f"Source: {CG_BASE}  •  Key: …{API_KEY[-4:]}  •  History: 90d hourly  •  Vol window: 24h  •  Overlap ≥90% of window")
+st.caption(f"Source: {CG_BASE}  •  Key: …{API_KEY[-4:]}  •  History: 365d  •  Vol window: 30d  •  Overlap ≥95% of window")
