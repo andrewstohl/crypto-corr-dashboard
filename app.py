@@ -1,23 +1,30 @@
-# app.py — VORA Price & Volatility Correlations (CoinGecko)
-# Token Focus only • Universe ≤ 250 • 365d history • Lookbacks: 7/14/30/90
-# Min coverage hardcoded 50% • Blue theme via .streamlit/config.toml
+# app.py — VORA Price & Volatility Correlations (CoinGecko, corrected)
+# - Token Focus only
+# - Universe up to 250 (top by market cap; stables excluded)
+# - 365d history (daily)
+# - Lookbacks: 7/14/30/90 (default 14D)
+# - Overlap requirement: >=85% of window for both price & vol correlations
+# - No forward-fill before returns (prevents fake correlations)
+# - Unique internal columns as SYM|coingecko_id to prevent symbol collisions
+# - Vol window fixed at 30d; correlations evaluated on the chosen lookback window
+# - Minimal clipping (only if window >=30d), applied in-window, not on full history
+# - Compact error logging
 
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-# -------------------- Page & styling --------------------
+# -------------------- Page & light CSS --------------------
 st.set_page_config(page_title="VORA Price & Volatility Correlations", layout="wide")
-
 st.markdown("""
 <style>
 /* Tidy top spacing + smaller title */
 header[data-testid="stHeader"] { height: auto; }
 div.block-container { padding-top: 1.0rem; }
-h1 { color:#0b1220; font-size:1.20rem; margin:0.35rem 0 0.5rem 0; }
+h1 { color:#0b1220; font-size:1.15rem; margin:0.35rem 0 0.5rem 0; }
 
 /* Sidebar — ensure sliders don’t clip on the right; narrow the internal slider width a bit */
 section[data-testid="stSidebar"] { min-width: 360px; }
@@ -25,7 +32,7 @@ section[data-testid="stSidebar"] .block-container { padding-right: 18px; }
 section[data-testid="stSidebar"] [data-baseweb="slider"] { margin-right: 10px; }
 section[data-testid="stSidebar"] [data-baseweb="slider"] > div { max-width: 94%; }
 
-/* Dataframe text slightly compact */
+/* Dataframe font slightly compact */
 div[data-testid="stDataFrame"] table { font-size: 0.92rem; }
 </style>
 """, unsafe_allow_html=True)
@@ -94,7 +101,8 @@ def http_get(path: str, params=None, timeout=30, retries=3, backoff=2.0):
 
 # -------------------- Universe (top by mkt cap; stables removed) --------------------
 STABLE_SYMS = {
-    "USDT","USDC","DAI","FDUSD","TUSD","USDE","USDL","USDP","PYUSD","GUSD","FRAX","LUSD","USDD","USDX","BUSD","EURT","EURS"
+    "USDT","USDC","DAI","FDUSD","TUSD","USDE","USDL","USDP","PYUSD","GUSD","FRAX",
+    "LUSD","USDD","USDX","BUSD","EURT","EURS"
 }
 
 @st.cache_data(show_spinner=False, ttl=60*60)
@@ -127,7 +135,7 @@ def fetch_universe_top_n(top_n=100):
             break
     return ids, syms, pd.DataFrame(rows)
 
-# -------------------- History (365 days daily, fixed) --------------------
+# -------------------- History (365 days daily, fixed; NO ffill) --------------------
 @st.cache_data(show_spinner=False, ttl=60*60*12)
 def fetch_hist_daily_series(coin_id: str) -> pd.Series | None:
     r = http_get(f"/coins/{coin_id}/market_chart", params={
@@ -146,7 +154,7 @@ def fetch_hist_daily_series(coin_id: str) -> pd.Series | None:
     ts = pd.to_datetime(df["ts_ms"], unit="ms", utc=True).dt.tz_convert(None)
     s = pd.Series(pd.to_numeric(df["price"], errors="coerce").astype(float).values, index=ts)
     s = s[~s.index.duplicated(keep="last")].sort_index()
-    daily = s.resample("D").last().ffill(limit=3)
+    daily = s.resample("D").last()           # <-- no forward-fill here
     daily = daily[daily > 0]
     if len(daily) < 30:
         log_err(f"short:{coin_id}")
@@ -156,12 +164,8 @@ def fetch_hist_daily_series(coin_id: str) -> pd.Series | None:
 
 # -------------------- Math --------------------
 def compute_returns(price_df: pd.DataFrame) -> pd.DataFrame:
-    rets = np.log(price_df).diff()
-    for col in rets.columns:
-        x = rets[col]
-        if x.notna().sum() > 10:
-            rets[col] = x.clip(x.quantile(0.001), x.quantile(0.999))
-    return rets
+    # No clipping here; clipping (if any) will be applied in-window later
+    return np.log(price_df).diff()
 
 def realized_vol(returns: pd.DataFrame, window: int = 30) -> pd.DataFrame:
     minp = max(2, window // 2)
@@ -188,32 +192,32 @@ def pairwise_corr(df: pd.DataFrame, min_overlap: int) -> pd.DataFrame:
                     M[j, i] = c
     return pd.DataFrame(M, index=cols, columns=cols)
 
-def focus_series(C: pd.DataFrame, token: str) -> pd.Series:
-    if C.empty or token not in C.columns:
+def focus_series(C: pd.DataFrame, colname: str) -> pd.Series:
+    if C.empty or colname not in C.columns:
         return pd.Series(dtype=float)
-    s = C[token].drop(index=token, errors="ignore").dropna()
+    s = C[colname].drop(index=colname, errors="ignore").dropna()
     return s
 
 # -------------------- Sidebar (order you requested) --------------------
 with st.sidebar:
     st.subheader("Settings")
 
-    # 1) Target token selector — always visible using session_state
-    if "focus_token" not in st.session_state:
-        st.session_state.focus_token = "ETH"  # default; corrected after load if needed
-    focus_token_widget = st.empty()  # options filled after data load, but the slot stays here
+    # 1) Target token — we’ll populate options after data loads, but keep the slot here
+    if "focus_token_symbol" not in st.session_state:
+        st.session_state.focus_token_symbol = "ETH"
+    focus_token_widget = st.empty()
 
-    # 2) Correlation lookback
-    corr_win = st.selectbox("Correlation lookback", ["7D", "14D", "30D", "90D"], index=3)
+    # 2) Correlation lookback (default 14D)
+    corr_win = st.selectbox("Correlation lookback", ["7D", "14D", "30D", "90D"], index=1)
 
     # 3) Min correlation
-    min_corr = st.slider("Min correlation", 0.00, 1.00, 0.85, step=0.01)
+    min_corr = st.slider("Min correlation", 0.00, 1.00, 0.90, step=0.01)
 
     # 4) Max correlation
     max_corr = st.slider("Max correlation", 0.00, 1.00, 0.99, step=0.01)
 
     # 5) Universe size
-    top_n = st.slider("Universe size (by mkt cap)", 20, 250, 250, step=10)
+    top_n = st.slider("Universe size (by mkt cap)", 20, 250, 100, step=10)
 
     st.divider()
     if st.button("🔄 Clear cache & reload", type="primary"):
@@ -224,12 +228,18 @@ ids, syms, _raw = fetch_universe_top_n(top_n=top_n)
 if not ids:
     st.error("Failed to fetch universe."); st.stop()
 
+# Build internal column naming (to avoid collisions)
+# internal name = SYM|id ; we’ll display SYM in UI/tables
+id2sym = dict(zip(ids, (s.upper() for s in syms)))
+internal_name = {cid: f"{id2sym[cid]}|{cid}" for cid in ids}  # e.g., ETH|ethereum
+
 # Fetch prices (365d)
 progress = st.progress(0.0, text="Loading 365d prices …")
 series = {}; fails = []
 for i, cid in enumerate(ids):
     s = fetch_hist_daily_series(cid)
     if s is not None:
+        s = s.rename(internal_name[cid])  # rename series to internal col name
         series[cid] = s
     else:
         fails.append(cid)
@@ -244,113 +254,150 @@ if fails:
 if not series:
     st.error("No price series available. Try smaller universe."); st.stop()
 
-# Aligned price matrix
+# Aligned price matrix (NO forward-fill)
 all_dates = pd.date_range(
     start=min(s.index.min() for s in series.values()),
     end=max(s.index.max() for s in series.values()),
     freq="D"
 )
-aligned = {cid: s.reindex(all_dates).ffill(limit=3) for cid, s in series.items()}
-prices = pd.DataFrame(aligned)
+aligned = {internal_name[cid]: s.reindex(all_dates) for cid, s in series.items()}
+prices = pd.DataFrame(aligned).replace([np.inf, -np.inf], np.nan).where(lambda x: x > 0)
 
-id2sym = dict(zip(ids, syms))
-prices.columns = [id2sym.get(c, c).upper() for c in prices.columns]
-prices = prices.replace([np.inf, -np.inf], np.nan).where(prices > 0)
-
-# Fill the token selector options now (keeps placement at the very top)
+# Sidebar token selector now that we know columns (by symbol list)
 with st.sidebar:
-    options = sorted(prices.columns.tolist())
-    # Keep previous choice if still available, else default to ETH or first
-    default_token = st.session_state.focus_token if st.session_state.focus_token in options else ("ETH" if "ETH" in options else options[0])
-    st.session_state.focus_token = focus_token_widget.selectbox("Target token", options=options, index=options.index(default_token))
-focus_token = st.session_state.focus_token
+    # Build a unique symbol list from our internal columns
+    colnames = list(prices.columns)
+    symbols = sorted({name.split("|", 1)[0] for name in colnames})
+    default_sym = st.session_state.focus_token_symbol if st.session_state.focus_token_symbol in symbols else \
+                  ("ETH" if "ETH" in symbols else symbols[0])
+    st.session_state.focus_token_symbol = focus_token_widget.selectbox("Target token", options=symbols,
+                                                                       index=symbols.index(default_sym))
+focus_symbol = st.session_state.focus_token_symbol
 
+# Map from symbol -> internal column name (there’s exactly one per symbol in our universe)
+sym2col = {}
+for col in prices.columns:
+    sym = col.split("|", 1)[0]
+    if sym not in sym2col:
+        sym2col[sym] = col  # first occurrence; we constructed universe with unique symbols
+focus_col = sym2col.get(focus_symbol)
+
+# Summary line
 st.write(f"Universe loaded: {prices.shape[1]} assets × {prices.shape[0]} days of prices.")
 
-# -------------------- Window selection (coverage hardcoded 50%) --------------------
-coverage = prices.notna().mean(axis=1)
-th = 0.50
-eligible = coverage[coverage >= th]
-end_date = eligible.index[-1] if len(eligible) > 0 else coverage.idxmax()
-
+# -------------------- Window selection (end at actual last date) --------------------
+end_date = prices.index.max()                # align with “today” in the dataset
 LOOK_MAP = {"7D": 7, "14D": 14, "30D": 30, "90D": 90}
 wdays = LOOK_MAP[corr_win]
 start_date = end_date - pd.Timedelta(days=wdays)
-st.caption(f"Window: {start_date.date()} → {end_date.date()}  •  coverage @ end: {coverage.loc[end_date]:.1%}")
+
+# coverage at end (informational only)
+coverage = prices.notna().mean(axis=1)
+cov_at_end = float(coverage.loc[end_date]) if end_date in coverage.index else np.nan
+st.caption(f"Window: {start_date.date()} → {end_date.date()}  •  coverage @ end (all assets): {cov_at_end:.1%}")
 
 # -------------------- Metrics & correlations --------------------
 ret_full = compute_returns(prices)
-vol_full = realized_vol(ret_full, window=30)  # fixed
+vol_full = realized_vol(ret_full, window=30)  # fixed 30d
 
+# Select the lookback window
 ret_w = ret_full.loc[start_date:end_date]
 vol_w = vol_full.loc[start_date:end_date]
 
-min_obs = max(3, wdays // 6)
-ret_w = ret_w.loc[:, ret_w.count() >= min_obs]
-vol_w = vol_w.loc[:, vol_w.count() >= max(2, 30//2)]
+# Optional, light clipping IN-WINDOW ONLY (disable for short windows)
+if wdays >= 30:
+    for c in ret_w.columns:
+        x = ret_w[c].dropna()
+        if len(x) > 30:
+            lo, hi = x.quantile(0.005), x.quantile(0.995)  # 0.5–99.5%
+            ret_w[c] = ret_w[c].clip(lo, hi)
 
-C_price = pairwise_corr(ret_w, min_overlap=min_obs)
-C_vol   = pairwise_corr(vol_w, min_overlap=max(2, 30//2))
+# Require >=85% overlap inside the window
+min_obs_price = max(5, int(round(0.85 * wdays)))
+min_obs_vol   = max(10, int(round(0.85 * wdays)))  # volatility series count in-window
+
+ret_w = ret_w.loc[:, ret_w.count() >= min_obs_price]
+vol_w = vol_w.loc[:, vol_w.count() >= min_obs_vol]
+
+C_price = pairwise_corr(ret_w, min_overlap=min_obs_price)
+C_vol   = pairwise_corr(vol_w, min_overlap=min_obs_vol)
 
 # -------------------- Token focus (tables only) --------------------
-st.subheader(f"🎯 {focus_token} — Correlations")
+st.subheader(f"🎯 {focus_symbol} — Correlations")
 
-# Individual series
-s_price = focus_series(C_price, focus_token)
-s_vol   = focus_series(C_vol,   focus_token)
-
-# Filter by range
-s_price_f = s_price[(s_price >= min_corr) & (s_price <= max_corr)].sort_values(ascending=False)
-s_vol_f   = s_vol[(s_vol >= min_corr) & (s_vol <= max_corr)].sort_values(ascending=False)
-
-# Joint best-pairs table (both high)
-joint = pd.concat([s_price.rename("ρ_price"), s_vol.rename("ρ_vol")], axis=1, join="inner").dropna()
-if not joint.empty:
-    joint["score_conservative"] = joint[["ρ_price","ρ_vol"]].min(axis=1)
-    joint["score_avg"] = joint[["ρ_price","ρ_vol"]].mean(axis=1)
-    joint_filtered = joint[(joint["ρ_price"].between(min_corr, max_corr)) &
-                           (joint["ρ_vol"].between(min_corr, max_corr))]
-    joint_ranked = joint_filtered.sort_values(by=["score_conservative","score_avg"], ascending=False)
+if focus_col is None or (C_price.empty and C_vol.empty):
+    st.info("Not enough data in-window for correlations. Try increasing lookback or universe size.")
 else:
-    joint_ranked = pd.DataFrame(columns=["ρ_price","ρ_vol","score_conservative","score_avg"])
+    # Individual series (internal names)
+    s_price = focus_series(C_price, focus_col)
+    s_vol   = focus_series(C_vol,   focus_col)
 
-st.markdown("**Best pairs (price & vol both high)** — ranked by conservative score = min(ρ_price, ρ_vol)")
-if not joint_ranked.empty:
-    st.dataframe(joint_ranked.round(4), use_container_width=True)
-    st.download_button(
-        f"Download {focus_token} joint correlations (CSV)",
-        joint_ranked.to_csv().encode(),
-        f"{focus_token}_joint_correlations.csv", "text/csv"
-    )
-else:
-    st.info("No tokens meet the range on both price and volatility.")
+    # Map index from internal names -> symbols for display
+    def to_symbol_index(s: pd.Series) -> pd.Series:
+        s2 = s.copy()
+        s2.index = [idx.split("|", 1)[0] for idx in s.index]
+        # collapse duplicates by taking max (shouldn’t happen given unique symbols, but safe)
+        return s2.groupby(s2.index).max()
 
-col1, col2 = st.columns(2)
-with col1:
-    st.markdown("**Price correlation (ρ)**")
-    if not s_price_f.empty:
-        dfp = s_price_f.rename("ρ").to_frame()
-        st.dataframe(dfp.round(4), use_container_width=True)
+    s_price_sym = to_symbol_index(s_price)
+    s_vol_sym   = to_symbol_index(s_vol)
+
+    # Filter by range
+    s_price_f = s_price_sym[(s_price_sym >= min_corr) & (s_price_sym <= max_corr)].sort_values(ascending=False)
+    s_vol_f   = s_vol_sym[(s_vol_sym >= min_corr) & (s_vol_sym <= max_corr)].sort_values(ascending=False)
+
+    # Joint best-pairs table (require presence in BOTH; rank by conservative min score)
+    joint = pd.concat([
+        s_price_sym.rename("ρ_price"),
+        s_vol_sym.rename("ρ_vol")
+    ], axis=1, join="inner").dropna()
+
+    if not joint.empty:
+        joint["score_conservative"] = joint[["ρ_price","ρ_vol"]].min(axis=1)
+        joint["score_avg"] = joint[["ρ_price","ρ_vol"]].mean(axis=1)
+        joint_filtered = joint[(joint["ρ_price"].between(min_corr, max_corr)) &
+                               (joint["ρ_vol"].between(min_corr, max_corr))]
+        joint_ranked = joint_filtered.sort_values(by=["score_conservative","score_avg"], ascending=False)
+    else:
+        joint_ranked = pd.DataFrame(columns=["ρ_price","ρ_vol","score_conservative","score_avg"])
+
+    st.markdown("**Best pairs (price & vol both high)** — ranked by conservative score = min(ρ_price, ρ_vol)")
+    if not joint_ranked.empty:
+        st.dataframe(joint_ranked.round(4), use_container_width=True)
         st.download_button(
-            f"Download {focus_token} price correlations (CSV)",
-            dfp.to_csv().encode(),
-            f"{focus_token}_price_correlations.csv", "text/csv"
+            f"Download {focus_symbol} joint correlations (CSV)",
+            joint_ranked.to_csv().encode(),
+            f"{focus_symbol}_joint_correlations.csv", "text/csv"
         )
     else:
-        st.info("No tokens in the selected range for price correlation.")
+        st.info("No tokens meet the range on both price and volatility.")
 
-with col2:
-    st.markdown("**Volatility correlation (ρ of σ(30d))**")
-    if not s_vol_f.empty:
-        dfv = s_vol_f.rename("ρ").to_frame()
-        st.dataframe(dfv.round(4), use_container_width=True)
-        st.download_button(
-            f"Download {focus_token} volatility correlations (CSV)",
-            dfv.to_csv().encode(),
-            f"{focus_token}_vol_correlations.csv", "text/csv"
-        )
-    else:
-        st.info("No tokens in the selected range for volatility correlation.")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Price correlation (ρ)**")
+        if not s_price_f.empty:
+            dfp = s_price_f.rename("ρ").to_frame()
+            st.dataframe(dfp.round(4), use_container_width=True)
+            st.download_button(
+                f"Download {focus_symbol} price correlations (CSV)",
+                dfp.to_csv().encode(),
+                f"{focus_symbol}_price_correlations.csv", "text/csv"
+            )
+        else:
+            st.info("No tokens in the selected range for price correlation.")
+
+    with col2:
+        st.markdown("**Volatility correlation (ρ of σ(30d))**")
+        if not s_vol_f.empty:
+            dfv = s_vol_f.rename("ρ").to_frame()
+            st.dataframe(dfv.round(4), use_container_width=True)
+            st.download_button(
+                f"Download {focus_symbol} volatility correlations (CSV)",
+                dfv.to_csv().encode(),
+                f"{focus_symbol}_vol_correlations.csv", "text/csv"
+            )
+        else:
+            st.info("No tokens in the selected range for volatility correlation.")
 
 # -------------------- Compact API error note (bottom) --------------------
 if error_log:
@@ -359,5 +406,5 @@ if error_log:
         for e in error_log[:200]:
             st.text(e)
 
-# Footer meta (small)
-st.caption(f"Source: {CG_BASE}  •  Key: …{API_KEY[-4:]}  •  History: 365d  •  Min coverage: 50%  •  Vol window: 30d (fixed)")
+# Footer meta
+st.caption(f"Source: {CG_BASE}  •  Key: …{API_KEY[-4:]}  •  History: 365d  •  Vol window: 30d  •  Overlap ≥85% of window")
