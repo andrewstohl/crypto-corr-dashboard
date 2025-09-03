@@ -1,376 +1,394 @@
 # app.py
-import time, math, requests, pandas as pd, numpy as np, streamlit as st
+# Streamlit dashboard: price & volatility correlations using CoinGecko API v3
+# Docs referenced:
+# - /coins/markets (universe/top coins) — https://docs.coingecko.com/v3.0.1/reference/coins-markets
+# - /coins/{id}/market_chart (history) — https://docs.coingecko.com/v3.0.1/reference/coins-id-market-chart
+# - Auth & base URLs — https://docs.coingecko.com/reference/authentication  (Pro)
+# - Rate limits (Demo ~30/min) — https://docs.coingecko.com/v3.0.1/reference/common-errors-rate-limit
+
+import time
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
+import requests
+import streamlit as st
 
-# ================== CONFIG ==================
-# CoinCap v3 endpoints (rotate on failure)
-COINCAP_BASES = [
-    "https://pro-api.coincap.io/v3",
-    "https://api.coincap.io/v3",
-    "https://rest.coincap.io/v3",
-]
+# -------------------- Page --------------------
+st.set_page_config(page_title="Crypto Correlations (CoinGecko)", layout="wide")
+st.title("🔗 Crypto Correlations — CoinGecko")
+st.caption(
+    "Top coins by market cap → fetch daily USD prices → compute correlation of returns "
+    "and correlation of rolling realized volatility. "
+    "Data granularity and 365-day limit for Demo per CoinGecko docs."
+)
 
-# Obvious stablecoins to exclude
-STABLE = {
-    "USDT","USDC","DAI","FDUSD","TUSD","USDe","USDL","USDP","PYUSD","GUSD","FRAX",
-    "LUSD","USDD","USDX","BUSD"
-}
-
-st.set_page_config(page_title="Crypto Correlations — CoinCap v3", layout="wide")
-
-# ================== AUTH ====================
-API_KEY = st.secrets.get("COINCAP_API_KEY", "")
+# -------------------- Secrets / Auth --------------------
+API_KEY = st.secrets.get("COINGECKO_API_KEY", "").strip()
 if not API_KEY:
-    st.error("Missing COINCAP_API_KEY in Streamlit Secrets.")
+    st.error("Missing COINGECKO_API_KEY in `.streamlit/secrets.toml`.")
     st.stop()
 
-def _headers():
-    return {
-        "Authorization": f"Bearer {API_KEY}",
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "User-Agent": "crypto-corr/solid-2.0"
-    }
+# Heuristics: A single function that tries Public (Demo) first, then Pro.
+PUBLIC_BASE = "https://api.coingecko.com/api/v3"
+PRO_BASE    = "https://pro-api.coingecko.com/api/v3"
 
-# Remember last working base during session
-if "COINCAP_BASE" not in st.session_state:
-    st.session_state.COINCAP_BASE = COINCAP_BASES[0]
+def _headers_for(base_url: str):
+    # Demo/Public uses x-cg-demo-api-key on PUBLIC_BASE
+    # Pro uses x-cg-pro-api-key on PRO_BASE
+    if base_url == PRO_BASE:
+        return {"x-cg-pro-api-key": API_KEY, "Accept": "application/json", "Accept-Encoding": "gzip"}
+    else:
+        return {"x-cg-demo-api-key": API_KEY, "Accept": "application/json", "Accept-Encoding": "gzip"}
 
-# ================== HTTP ====================
-def http_get(path, params=None, timeout=30, retries=2):
-    """
-    GET against CoinCap with retry and base failover. Path must start with '/'.
-    """
-    params = params or {}
-    # Also pass apiKey as query to satisfy some gateways
-    params = dict(params)
-    params.setdefault("apiKey", API_KEY)
-
-    bases = [st.session_state.COINCAP_BASE] + [b for b in COINCAP_BASES if b != st.session_state.COINCAP_BASE]
-    last_err = None
-
-    for base in bases:
-        url = base + path
-        for attempt in range(retries + 1):
-            try:
-                r = requests.get(url, params=params, headers=_headers(), timeout=timeout)
-                if r.status_code == 429:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                if r.status_code >= 400:
-                    last_err = (r.status_code, r.text[:300])
-                    break  # try next base
-                st.session_state.COINCAP_BASE = base
-                return r
-            except Exception as e:
-                last_err = (type(e).__name__, str(e)[:200])
-                time.sleep(0.5)
-                continue
-
-    if last_err:
-        st.error(f"CoinCap request failed for {path}. Last error: {last_err[0]}")
-        st.code(str(last_err[1]))
-    raise requests.HTTPError(f"All CoinCap bases failed for {path}: {last_err}")
-
-# =============== DATA FETCH =================
-@st.cache_data(show_spinner=False, ttl=60*60*12)
-def fetch_universe(limit=250):
-    """
-    Top-ranked assets, drop stables, dedupe by symbol, cap at 100.
-    Returns: (ids, symbols)
-    """
-    r = http_get("/assets", params={"limit": limit})
-    data = r.json()
-    rows = data.get("data", data.get("assets", [])) if isinstance(data, dict) else (data or [])
-    rows = [x for x in rows if isinstance(x, dict) and x.get("rank")]
-    for x in rows:
+@st.cache_resource(show_spinner=False)
+def select_working_cg_base() -> str:
+    # Try PUBLIC first (most users with CG-… keys are Demo)
+    for base in (PUBLIC_BASE, PRO_BASE):
         try:
-            x["_rank"] = int(x["rank"])
-        except:
-            x["_rank"] = 10**9
-    rows.sort(key=lambda x: x["_rank"])
+            r = requests.get(f"{base}/ping", headers=_headers_for(base), timeout=15)
+            if r.status_code == 200:
+                return base
+            # Some proxies block /ping; try a lightweight markets call
+            r2 = requests.get(
+                f"{base}/coins/markets",
+                params={"vs_currency": "usd", "per_page": 1, "page": 1, "order": "market_cap_desc"},
+                headers=_headers_for(base), timeout=20
+            )
+            if r2.status_code == 200:
+                return base
+        except requests.RequestException:
+            pass
+    # If both failed, fall back to PUBLIC to at least show an error later
+    return PUBLIC_BASE
 
-    ids, syms, seen = [], [], set()
+CG_BASE = select_working_cg_base()
+st.caption(f"Using CoinGecko base: `{CG_BASE}`")
+
+# -------------------- HTTP with retries / 429 handling --------------------
+def http_get(path: str, params=None, timeout=30, retries=3, backoff=2.0):
+    url = f"{CG_BASE}{path}"
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params or {}, headers=_headers_for(CG_BASE), timeout=timeout)
+            if r.status_code == 200:
+                return r
+            if r.status_code == 401:
+                st.error("CoinGecko auth failed (401). Check that your key matches the host: "
+                         "Demo → api.coingecko.com, Pro → pro-api.coingecko.com.")
+                st.stop()
+            if r.status_code == 429:
+                # Too many requests: exponential backoff, protect credits
+                time.sleep(backoff * (attempt + 1))
+                continue
+            # Other 4xx/5xx — keep last_err and retry
+            last_err = f"{r.status_code}: {r.text[:200]}"
+        except requests.RequestException as e:
+            last_err = str(e)
+        time.sleep(0.25)
+    st.error(f"GET {path} failed after retries. Last error: {last_err}")
+    return None
+
+# -------------------- Universe (top N by market cap) --------------------
+STABLE_SYMS = {
+    "USDT","USDC","DAI","FDUSD","TUSD","USDE","USDL","USDP","PYUSD","GUSD","FRAX","LUSD","USDD","USDX","BUSD","EURT","EURS"
+}
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def fetch_universe_top_n(top_n=100):
+    # Pull first up to 250 coins by market cap in one call, then filter to N non-stable unique symbols.
+    # /coins/markets supports per_page and page; update freq every 60s on Public per docs.
+    r = http_get("/coins/markets", params={
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": 250,
+        "page": 1,
+        "sparkline": "false",
+        "price_change_percentage": ""
+    }, timeout=40, retries=3)
+    if not r:
+        return [], [], pd.DataFrame()
+    rows = r.json()
+    if not isinstance(rows, list) or not rows:
+        return [], [], pd.DataFrame()
+
+    # Filter non-stable, dedupe by symbol, keep order
+    ids, syms = [], []
+    seen = set()
     for row in rows:
-        aid = row.get("id", "")
         sym = str(row.get("symbol", "")).upper()
-        name = str(row.get("name", "")).lower()
-        if not aid or not sym:
-            continue
-        if sym in STABLE or "stable" in name or sym.endswith("USD"):
+        if not sym or sym in STABLE_SYMS:
             continue
         if sym in seen:
             continue
+        cid = row.get("id")
+        if not cid:
+            continue
         seen.add(sym)
-        ids.append(aid); syms.append(sym)
-        if len(ids) >= 100:
+        ids.append(cid)
+        syms.append(sym)
+        if len(ids) >= top_n:
             break
-    return ids, syms
 
+    return ids, syms, pd.DataFrame(rows)
+
+# -------------------- History --------------------
+# Public (Demo) access to history is restricted to PAST 365 DAYS ONLY. (docs L15)
+# /coins/{id}/market_chart returns "prices": [[ts_ms, price], ...] with daily points when days > 90 (docs L14).
 @st.cache_data(show_spinner=False, ttl=60*60*12)
-def fetch_hist_daily(asset_id: str, days: int = 365) -> pd.Series | None:
-    """
-    Daily history from CoinCap v3. No forward fill here. Returns pd.Series(price, index=UTC dates).
-    """
-    end_ms   = int(pd.Timestamp.utcnow().timestamp() * 1000)
-    start_ms = int((pd.Timestamp.utcnow() - pd.Timedelta(days=days)).timestamp() * 1000)
-
-    r = http_get(
-        f"/assets/{asset_id}/history",
-        params={"interval": "d1", "start": start_ms, "end": end_ms},
-        retries=1
-    )
+def fetch_hist_daily_series(coin_id: str, days: int = 365) -> pd.Series | None:
+    # Keep days within [30, 365] to avoid excessive requests; daily points kick in above 90 days.
+    days = max(30, min(365, int(days)))
+    params = {"vs_currency": "usd", "days": days, "interval": "daily"}  # interval hints daily; API can auto-granularize
+    r = http_get(f"/coins/{coin_id}/market_chart", params=params, timeout=40, retries=3)
+    if not r:
+        return None
     data = r.json()
-    arr = data.get("data", data.get("history", data.get("prices", []))) if isinstance(data, dict) else (data or [])
-    if not arr:
+    prices = data.get("prices") or []
+    if not prices:
         return None
-
-    df = pd.DataFrame(arr)
-    time_col = None
-    price_col = None
-    for col in df.columns:
-        cl = col.lower()
-        if cl in ("time", "timestamp", "date", "datetime"):
-            time_col = col
-        if cl in ("priceusd", "price", "close", "price_usd"):
-            price_col = col
-    if time_col is None or price_col is None:
+    df = pd.DataFrame(prices, columns=["ts_ms", "price"])
+    # To daily series
+    ts = pd.to_datetime(df["ts_ms"], unit="ms", utc=True).dt.tz_convert(None)
+    s = pd.Series(pd.to_numeric(df["price"], errors="coerce").astype(float).values, index=ts)
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    # Force daily calendar, last known price for day, limited ffill for tiny gaps
+    daily = s.resample("D").last().ffill(limit=3)
+    daily = daily[daily > 0]
+    if len(daily) < 30:
         return None
+    daily.name = coin_id
+    return daily
 
-    tvals = pd.to_numeric(df[time_col], errors="coerce")
-    if tvals.max() > 1e10:
-        ts = pd.to_datetime(tvals, unit="ms", utc=True)
-    else:
-        ts = pd.to_datetime(tvals, unit="s", utc=True)
+# -------------------- Correlation helpers --------------------
+def compute_returns(price_df: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(price_df).diff()
+    # Clip extreme outliers per column (protect corr from one bad print)
+    for col in rets.columns:
+        x = rets[col]
+        if x.notna().sum() > 10:
+            ql = x.quantile(0.001)
+            qh = x.quantile(0.999)
+            rets[col] = x.clip(ql, qh)
+    return rets
 
-    px = pd.to_numeric(df[price_col], errors="coerce").astype(float)
-    s = pd.Series(px.values, index=ts).sort_index()
-    s = s.replace([np.inf, -np.inf], np.nan)
-    s[s <= 0] = np.nan
-    # Coerce to calendar daily grid ending at its own last point (no ffill here)
-    # We'll align later on a common grid.
-    return s
-
-# =============== HELPERS ====================
-def uniqueify(labels):
-    out, used = [], {}
-    for x in labels:
-        if x not in used:
-            used[x] = 1; out.append(x)
-        else:
-            used[x] += 1; out.append(f"{x}#{used[x]}")
-    return out
-
-def choose_best_end_date(prices: pd.DataFrame, lookback_days: int, search_days: int = 180, min_points_per_col: int = 10):
-    """
-    Scan the last ~search_days and pick the end-date that maximizes how many columns
-    have at least min_points_per_col valid points inside the rolling window (lookback_days).
-    """
-    if prices.empty:
-        return None
-    counts = prices.notna().rolling(lookback_days, min_periods=1).sum()
-    recent_idx = counts.index[counts.index >= counts.index.max() - pd.Timedelta(days=search_days)]
-    sub = counts.loc[recent_idx] if len(recent_idx) else counts
-    score = (sub >= min_points_per_col).sum(axis=1)
-    if score.empty:
-        return None
-    return score.idxmax()
-
-def prune_in_window(M: pd.DataFrame, min_non_null=3):
-    if M is None or M.empty:
-        return M
-    M = M.loc[:, M.count() >= min_non_null]
-    if M.empty:
-        return M
-    M = M.loc[:, M.std(skipna=True) > 0]
-    return M
+def realized_vol(returns: pd.DataFrame, window: int) -> pd.DataFrame:
+    # Annualized daily vol with flexible min_periods
+    minp = max(2, window // 2)
+    return returns.rolling(window, min_periods=minp).std() * np.sqrt(365)
 
 def pairwise_corr(df: pd.DataFrame, min_overlap: int) -> pd.DataFrame:
-    cols = list(df.columns); n = len(cols)
-    if n == 0: return pd.DataFrame()
-    out = np.full((n, n), np.nan, dtype=float)
+    if df.empty or df.shape[1] < 2:
+        return pd.DataFrame()
+    Z = (df - df.mean()) / df.std(ddof=0)
+    Z = Z.replace([np.inf, -np.inf], np.nan)
+    cols = list(Z.columns)
+    n = len(cols)
+    M = np.full((n, n), np.nan, dtype=float)
     for i in range(n):
-        out[i, i] = 1.0
-        xi = df[cols[i]].values
-        for j in range(i+1, n):
-            xj = df[cols[j]].values
+        M[i, i] = 1.0
+        xi = Z.iloc[:, i].to_numpy()
+        for j in range(i + 1, n):
+            xj = Z.iloc[:, j].to_numpy()
             mask = np.isfinite(xi) & np.isfinite(xj)
-            k = int(mask.sum())
-            if k >= min_overlap:
-                a = xi[mask]; b = xj[mask]
-                ca = a - a.mean(); cb = b - b.mean()
-                denom = np.sqrt((ca*ca).sum()) * np.sqrt((cb*cb).sum())
-                if denom > 0:
-                    out[i, j] = out[j, i] = float((ca*cb).sum() / denom)
-    return pd.DataFrame(out, index=cols, columns=cols)
+            if mask.sum() >= min_overlap:
+                c = np.corrcoef(xi[mask], xj[mask])[0, 1]
+                if np.isfinite(c):
+                    M[i, j] = c
+                    M[j, i] = c
+    return pd.DataFrame(M, index=cols, columns=cols)
 
-def render_heatmap(M: pd.DataFrame, title: str, key: str):
-    if M.empty or not np.isfinite(M.values).any():
-        st.warning(f"No finite values for {title}. Widen lookback or lower min overlap.")
+def render_heatmap(C: pd.DataFrame, title: str, key: str):
+    if C.empty:
+        st.warning(f"No data for {title}")
         return
-    # If very large, show top-20 by avg |corr| to keep it readable
-    if M.shape[0] > 24:
-        avg_abs = np.abs(M).mean(axis=1).sort_values(ascending=False)
-        keep = avg_abs.head(24).index
-        M = M.loc[keep, keep]
-    fig = go.Figure(data=go.Heatmap(
-        z=M.values, x=M.columns.tolist(), y=M.index.tolist(),
-        zmin=-1, zmax=1, zmid=0, colorscale="RdBu", colorbar=dict(title="ρ")
-    ))
-    fig.update_layout(title=title, margin=dict(l=0, r=0, t=40, b=0))
-    # Unique key prevents DuplicateElementId
-    st.plotly_chart(fig, key=key)
+    # If big, show the 25 assets with highest average |corr|
+    if C.shape[0] > 25:
+        avg_abs = np.abs(C).mean(axis=1)
+        keep = avg_abs.nlargest(25).index
+        C = C.loc[keep, keep]
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=C.values,
+            x=C.columns.tolist(),
+            y=C.index.tolist(),
+            zmin=-1, zmax=1, zmid=0,
+            colorscale="RdBu_r",
+            colorbar=dict(title="ρ"),
+            text=np.round(C.values, 2),
+            texttemplate="%{text}",
+            textfont={"size": 9},
+            hoverongaps=False,
+        )
+    )
+    fig.update_layout(
+        title=title,
+        xaxis=dict(tickangle=-45, side="bottom"),
+        yaxis=dict(autorange="reversed"),
+        width=None, height=700, margin=dict(l=100, r=20, t=60, b=100)
+    )
+    st.plotly_chart(fig, key=key, width="stretch")
 
 def top_pairs(C: pd.DataFrame, k=30) -> pd.DataFrame:
-    if C.empty: return pd.DataFrame(columns=["A","B","|rho|","rho"])
-    cols = list(C.columns); vals = C.values; n = len(cols)
+    if C.empty:
+        return pd.DataFrame()
     pairs = []
-    for i in range(n):
-        for j in range(i+1, n):
-            v = vals[i, j]
+    cols = list(C.columns)
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            v = C.iat[i, j]
             if np.isfinite(v):
-                pairs.append((cols[i], cols[j], abs(float(v)), float(v)))
+                pairs.append({"A": cols[i], "B": cols[j], "Correlation": float(np.round(v, 4)),
+                              "Abs|ρ|": float(np.round(abs(v), 4))})
     if not pairs:
-        return pd.DataFrame(columns=["A","B","|rho|","rho"])
-    return pd.DataFrame(pairs, columns=["A","B","|rho|","rho"]).sort_values("|rho|", ascending=False).head(k)
+        return pd.DataFrame()
+    df = pd.DataFrame(pairs).sort_values("Abs|ρ|", ascending=False).head(k).reset_index(drop=True)
+    return df[["A", "B", "Correlation"]]
 
-# =============== SIDEBAR ====================
+# -------------------- Sidebar --------------------
 with st.sidebar:
-    st.title("Controls")
-    universe_size = st.select_slider("Universe size (by rank)", options=[50, 75, 100], value=100)
-    hist_days     = st.select_slider("History window (days)", options=[180, 270, 365], value=365)
-    lookback_s    = st.selectbox("Correlation lookback", ["7D","30D","90D"], index=1)
-    vol_roll_s    = st.selectbox("Volatility roll window (days)", ["7","14","30","60"], index=2)
-    min_overlap   = st.slider("Min overlap (days) per pair", 3, 60, 10, step=1)
-    topk          = st.slider("Top pairs to show", 10, 100, 30, step=5)
-    demo_mode     = st.toggle("Demo mode (no API calls)", value=False, help="Loads a tiny baked sample so you can test UI without spending credits.")
-    if st.button("Clear cache & refetch"):
-        fetch_universe.clear(); fetch_hist_daily.clear()
-        st.success("Cache cleared. Data will refetch on next run.")
+    st.header("⚙️ Settings")
+    top_n = st.slider("Universe size (by market cap, stables excluded)", 20, 100, 50, step=10)
+    hist_days = st.select_slider("Historical window to fetch", options=[90, 180, 270, 365], value=365)
+    corr_win = st.selectbox("Correlation lookback", ["30D", "90D"], index=1)
+    vol_win = st.selectbox("Volatility window (days)", [7, 14, 30], index=2)
+    min_cov = st.slider("Min % asset coverage at end date", 40, 100, 60, step=5)
+    show_tables = st.checkbox("Show top-pairs tables", value=True)
+    st.divider()
+    if st.button("🔄 Clear cache & reload", type="primary"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
+    st.caption(f"API host: `{CG_BASE}`  •  Key suffix: `{API_KEY[-4:]}`")
 
-st.caption("Source: CoinCap v3 (API key). We auto-pick the best end date for your lookback, avoid forward-filling before returns, and compute pairwise correlations with per-pair overlap.")
+# -------------------- Load universe --------------------
+ids, syms, raw = fetch_universe_top_n(top_n=top_n)
+if not ids:
+    st.error("Failed to fetch universe from CoinGecko.")
+    st.stop()
 
-# =============== DEMO (optional) =============
-if demo_mode:
-    # Small embedded demo: BTC/ETH/SOL/BNB synthetic-ish series to verify UI without API calls
-    idx = pd.date_range(end=pd.Timestamp.utcnow().normalize(), periods=120, freq="D", tz="UTC")
-    rng = np.random.default_rng(42)
-    def synth(mu=0.0007, sigma=0.03):
-        r = rng.normal(mu, sigma, size=len(idx))
-        return pd.Series(np.exp(r).cumprod(), index=idx)
-    prices = pd.DataFrame({
-        "BTC": 30000 * synth(0.0006, 0.025),
-        "ETH": 2000  * synth(0.0007, 0.03),
-        "SOL": 40    * synth(0.0010, 0.05),
-        "BNB": 250   * synth(0.0005, 0.02),
-    })
-    st.info("Demo mode active — no API calls made.")
-else:
-    # =============== UNIVERSE =================
-    ids, syms = fetch_universe()
-    if len(ids) > universe_size:
-        ids, syms = ids[:universe_size], syms[:universe_size]
-    st.write(f"Universe selected: {len(ids)} assets (stables excluded; unique symbols).")
+st.success(f"Universe: {len(ids)} assets (unique symbols, stables excluded). Examples: {', '.join(syms[:8])} …")
 
-    # =============== PRICES ==================
-    progress = st.progress(0)
-    series = {}
-    for i, aid in enumerate(ids):
-        s = fetch_hist_daily(aid, days=hist_days)
-        if s is not None and len(s) >= 3:
-            series[aid] = s
-        progress.progress((i+1)/len(ids))
-        time.sleep(0.02)  # polite; cached after first run
-    progress.empty()
+# -------------------- Fetch history (throttled) --------------------
+# Protect Demo rate limit (~30/min). We also retry on 429 inside http_get.
+series = {}
+failed = []
+progress = st.progress(0.0, text="Fetching price history …")
+for i, cid in enumerate(ids):
+    s = fetch_hist_daily_series(cid, days=hist_days)
+    if s is not None:
+        series[cid] = s
+    else:
+        failed.append(cid)
+    progress.progress((i + 1) / len(ids), text=f"Fetched {i+1}/{len(ids)} • ok={len(series)} fail={len(failed)}")
+    # Gentle pacing to avoid bursts. Most runs hit cache; first warm run will pace a bit.
+    time.sleep(0.15)
+progress.empty()
 
-    if not series:
-        st.error("No price series fetched from CoinCap.")
-        st.stop()
+if not series:
+    st.error("No historical data returned. Check key/plan or try smaller universe.")
+    st.stop()
 
-    # Align all series on a bounded daily grid (last `hist_days` ending at global max end)
-    max_end = max(s.index.max() for s in series.values())
-    all_dates = pd.date_range(end=max_end, periods=hist_days, freq="D", tz="UTC")
+# -------------------- Build aligned price matrix --------------------
+# Common calendar
+all_dates = pd.date_range(
+    start=min(s.index.min() for s in series.values()),
+    end=max(s.index.max() for s in series.values()),
+    freq="D"
+)
+aligned = {}
+for cid, s in series.items():
+    a = s.reindex(all_dates).ffill(limit=3)  # short gaps only
+    aligned[cid] = a
 
-    aligned = {}
-    for aid, s in series.items():
-        aligned[aid] = s.reindex(all_dates)  # NO forward-fill
-
-    prices = pd.DataFrame(aligned).sort_index()
-    # Map columns to unique symbols (avoid collapsing same symbol)
-    id2sym = dict(zip(ids, syms))
-    col_labels = [id2sym.get(c, c).upper() for c in prices.columns]
-    prices.columns = uniqueify(col_labels)
-    prices = prices.replace([np.inf, -np.inf], np.nan)
-    prices[prices <= 0] = np.nan
+prices = pd.DataFrame(aligned)
+id2sym = dict(zip(ids, syms))
+prices.columns = [id2sym.get(c, c).upper() for c in prices.columns]
+prices = prices.replace([np.inf, -np.inf], np.nan)
+prices = prices.where(prices > 0)
 
 st.write(f"Prices matrix: {prices.shape[1]} assets × {prices.shape[0]} days.")
+st.caption("Per docs: above 90 days, market_chart returns daily points (00:00 UTC). Last completed day is available ~00:10 UTC next day.")
 
-# =============== WINDOW PICK =================
-lookback = {"7D":7, "30D":30, "90D":90}[lookback_s]
-min_pts_per_col = max(3, int(math.ceil(lookback/3)))
+# -------------------- Choose end date by coverage --------------------
+coverage = prices.notna().mean(axis=1)
+th = min_cov / 100.0
+eligible = coverage[coverage >= th]
+if len(eligible) > 0:
+    end_date = eligible.index[-1]
+else:
+    end_date = coverage.idxmax()  # best we can do
+st.write(f"End date selected: **{end_date.date()}**  •  coverage: **{coverage.loc[end_date]:.1%}**")
 
-end_date = choose_best_end_date(prices, lookback_days=lookback, search_days=180, min_points_per_col=min_pts_per_col)
-if end_date is None:
-    st.error("No usable end date found. Increase history or lower min overlap.")
-    st.stop()
-start_date = end_date - pd.Timedelta(days=lookback-1)
-st.write(f"Window: {start_date.date()} → {end_date.date()} (min points/col in-window = {min_pts_per_col})")
+# -------------------- Compute metrics --------------------
+ret = compute_returns(prices)
+sigma = realized_vol(ret, window=int(vol_win))
 
-# =============== RETURNS & VOL ===============
-rets_full = np.log(prices).diff()
-# gentle outlier clipping per column to stabilize small windows
-q_low, q_high = 0.001, 0.999
-rets_full = rets_full.apply(lambda s: s.clip(lower=s.quantile(q_low), upper=s.quantile(q_high)))
+# Window slice
+LOOK_MAP = {"30D": 30, "90D": 90}
+wdays = LOOK_MAP[corr_win]
+start_date = end_date - pd.Timedelta(days=wdays)
+ret_w = ret.loc[start_date:end_date]
+sig_w = sigma.loc[start_date:end_date]
 
-rv_full = rets_full.rolling(int(st.session_state.get("VOL_ROLL", 0) or 1), min_periods=1).std()  # temporary init
+# Require some data inside window
+min_obs = max(3, wdays // 6)
+valid_ret_cols = ret_w.count().loc[ret_w.count() >= min_obs].index
+valid_sig_cols = sig_w.count().loc[sig_w.count() >= max(2, int(vol_win)//2)].index
 
-roll_w = int(vol_roll_s)
-rv_full = rets_full.rolling(roll_w, min_periods=max(2, roll_w//2)).std() * math.sqrt(365)
+ret_w = ret_w[valid_ret_cols]
+sig_w = sig_w[valid_sig_cols]
 
-rets_win = rets_full.loc[start_date:end_date]
-rv_win   = rv_full.loc[start_date:end_date]
+C_ret = pairwise_corr(ret_w, min_overlap=min_obs)
+C_sig = pairwise_corr(sig_w, min_overlap=max(2, int(vol_win)//2))
 
-# Drop dead columns in-window only
-rets_win = prune_in_window(rets_win, min_non_null=max(3, lookback//6))
-rv_win   = prune_in_window(rv_win,   min_non_null=max(3, lookback//6))
+# -------------------- Display --------------------
+tab1, tab2, tab3 = st.tabs(["📈 Price correlation", "📊 Volatility correlation", "🔍 Debug"])
 
-# =============== CORRELATIONS ================
-corr_price = pairwise_corr(rets_win, min_overlap=min_overlap)
-corr_vol   = pairwise_corr(rv_win,   min_overlap=min_overlap)
-st.write(f"Corr shapes → price: {corr_price.shape}, vol: {corr_vol.shape}")
-
-# Quick previews
-st.write("Price corr (top-left 5×5)")
-st.dataframe(corr_price.iloc[:5, :5].round(3), width="stretch")
-st.write("Vol corr (top-left 5×5)")
-st.dataframe(corr_vol.iloc[:5, :5].round(3), width="stretch")
-
-# =============== HEATMAPS & TABLES ===========
-col1, col2 = st.columns(2)
-with col1:
-    render_heatmap(corr_price, f"Price correlation — last {lookback_s}", key="heat_price")
-    st.subheader("Top price-corr pairs")
-    tp = top_pairs(corr_price, k=topk)
-    if not tp.empty:
-        st.dataframe(tp, width="stretch")
-        st.download_button("Download price-corr matrix CSV", corr_price.to_csv().encode(),
-                           file_name="corr_price.csv", mime="text/csv", key="dl_price")
+with tab1:
+    if not C_ret.empty:
+        render_heatmap(C_ret, f"Price correlation — last {corr_win}", key="hm_price")
+        if show_tables:
+            tp = top_pairs(C_ret, k=30)
+            if not tp.empty:
+                st.subheader("Top pairs by |price correlation|")
+                st.dataframe(tp, use_container_width=True, hide_index=True)
+                st.download_button("Download price-corr matrix (CSV)", C_ret.to_csv().encode(), "price_corr.csv", "text/csv")
     else:
-        st.info("No pairs met the overlap/variance thresholds.")
-with col2:
-    render_heatmap(corr_vol, f"Volatility correlation — last {lookback_s} (σ roll {roll_w}d)", key="heat_vol")
-    st.subheader("Top vol-corr pairs")
-    tv = top_pairs(corr_vol, k=topk)
-    if not tv.empty:
-        st.dataframe(tv, width="stretch")
-        st.download_button("Download vol-corr matrix CSV", corr_vol.to_csv().encode(),
-                           file_name="corr_vol.csv", mime="text/csv", key="dl_vol")
-    else:
-        st.info("No pairs met the overlap/variance thresholds.")
+        st.warning("No finite price correlations with current settings. Try 90D and/or lower Min % coverage.")
 
-# =============== FOOTER ======================
+with tab2:
+    if not C_sig.empty:
+        render_heatmap(C_sig, f"Volatility correlation — last {corr_win} (σ {vol_win}d)", key="hm_vol")
+        if show_tables:
+            tv = top_pairs(C_sig, k=30)
+            if not tv.empty:
+                st.subheader("Top pairs by |volatility correlation|")
+                st.dataframe(tv, use_container_width=True, hide_index=True)
+                st.download_button("Download vol-corr matrix (CSV)", C_sig.to_csv().encode(), "vol_corr.csv", "text/csv")
+    else:
+        st.warning("No finite volatility correlations with current settings. Try 90D and/or σ=30d, and/or lower Min % coverage.")
+
+with tab3:
+    st.json({
+        "CG_BASE": CG_BASE,
+        "universe_count": len(ids),
+        "history_series_returned": len(series),
+        "failed_assets": len(failed),
+        "prices_shape": prices.shape,
+        "end_date": str(end_date.date()),
+        "window_days": wdays,
+        "min_overlap": min_obs,
+        "ret_w_shape": ret_w.shape,
+        "sig_w_shape": sig_w.shape,
+        "finite_correlations_price": int(np.isfinite(C_ret.values).sum()) if not C_ret.empty else 0,
+        "finite_correlations_vol": int(np.isfinite(C_sig.values).sum()) if not C_sig.empty else 0,
+    })
+
 st.caption(
-    "Notes: No forward-fill is applied before returns to avoid zero-variance columns. "
-    "We pick the end date that maximizes in-window coverage over the last ~6 months. "
-    "Pairwise correlations require a minimum overlap you control in the sidebar."
+    "Notes: Public/Demo historical access is limited to the past 365 days and returns daily points when the requested range is >90 days; "
+    "the last completed UTC day is available ~00:10 UTC. "
+    "If you upgrade to Pro, the app auto-detects and switches to the Pro host/header."
 )
