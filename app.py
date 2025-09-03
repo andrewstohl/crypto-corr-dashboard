@@ -208,16 +208,17 @@ with st.sidebar:
     focus_token_widget = st.empty()
 
     # 2) Correlation lookback (default 14D)
-    corr_win = st.selectbox("Correlation lookback", ["7D", "14D", "30D", "90D"], index=1)
+    opts = ["7D", "14D", "30D", "90D"]
+    corr_win = st.selectbox("Correlation lookback", opts, index=opts.index("30D"), key="corr_win")
 
     # 3) Min correlation
-    min_corr = st.slider("Min correlation", 0.00, 1.00, 0.90, step=0.01)
+    min_corr = st.slider("Min correlation", 0.00, 1.00, 0.85, step=0.01)
 
     # 4) Max correlation
     max_corr = st.slider("Max correlation", 0.00, 1.00, 0.99, step=0.01)
 
     # 5) Universe size
-    top_n = st.slider("Universe size (by mkt cap)", 20, 250, 100, step=10)
+    top_n = st.slider("Universe size (by mkt cap)", 20, 250, 200, step=10)
 
     st.divider()
     if st.button("🔄 Clear cache & reload", type="primary"):
@@ -313,8 +314,8 @@ if wdays >= 30:
             ret_w[c] = ret_w[c].clip(lo, hi)
 
 # Require >=85% overlap inside the window
-min_obs_price = max(5, int(round(0.85 * wdays)))
-min_obs_vol   = max(10, int(round(0.85 * wdays)))  # volatility series count in-window
+min_obs_price = max(5, int(round(0.95 * wdays)))
+min_obs_vol   = max(10, int(round(0.95 * wdays)))  # volatility series count in-window
 
 ret_w = ret_w.loc[:, ret_w.count() >= min_obs_price]
 vol_w = vol_w.loc[:, vol_w.count() >= min_obs_vol]
@@ -407,4 +408,4 @@ if error_log:
             st.text(e)
 
 # Footer meta
-st.caption(f"Source: {CG_BASE}  •  Key: …{API_KEY[-4:]}  •  History: 365d  •  Vol window: 30d  •  Overlap ≥85% of window")
+st.caption(f"Source: {CG_BASE}  •  Key: …{API_KEY[-4:]}  •  History: 365d  •  Vol window: 30d  •  Overlap ≥95% of window")
