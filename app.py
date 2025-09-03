@@ -1,59 +1,78 @@
 import time, math, requests, pandas as pd, numpy as np, streamlit as st
 import plotly.graph_objects as go
 
-# ---------- CONFIG ----------
-BINANCE_API = "https://api.binance.com/api/v3"
-st.set_page_config(page_title="Crypto Correlations — Binance (free)", layout="wide")
+st.set_page_config(page_title="Crypto Correlations — Binance (no CoinCap calls)", layout="wide")
 
-# ---------- HTTP ----------
-def http_get(url, params=None, timeout=60):
-    r = requests.get(url, params=params or {}, timeout=timeout)
-    r.raise_for_status()
-    return r
+# -------- Binance base endpoints (rotate until one works) --------
+BINANCE_BASES = [
+    "https://api.binance.com",
+    "https://api-gcp.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
 
-# ---------- UNIVERSE: top USDT spot pairs by volume ----------
+# cache the first working base in the session
+if "BINANCE_BASE" not in st.session_state:
+    st.session_state.BINANCE_BASE = None
+
+def binance_get(path, params=None, timeout=30, expect_json=True):
+    params = params or {}
+    # try remembered base first
+    bases = [st.session_state.BINANCE_BASE] + BINANCE_BASES if st.session_state.BINANCE_BASE else BINANCE_BASES
+    last_err = None
+    for base in bases:
+        if not base: 
+            continue
+        try:
+            r = requests.get(base + path, params=params, timeout=timeout, headers={"User-Agent":"streamlit-binance-rotator/1.0"})
+            if r.status_code >= 400:
+                last_err = (r.status_code, r.text[:300])
+                continue
+            st.session_state.BINANCE_BASE = base
+            return r.json() if expect_json else r
+        except Exception as e:
+            last_err = (type(e).__name__, str(e)[:200])
+            continue
+    if last_err:
+        st.error(f"Binance request failed for all bases on {path}. Last error: {last_err[0]}")
+    raise requests.HTTPError(f"All Binance bases failed for {path}: {last_err}")
+
 @st.cache_data(show_spinner=False, ttl=60*60*6)
 def get_universe_from_binance(top_n=100):
-    # Exchange info (symbols metadata)
-    ei = http_get(f"{BINANCE_API}/exchangeInfo").json()
+    # Exchange metadata
+    ei = binance_get("/api/v3/exchangeInfo")
     symbols = ei.get("symbols", [])
     spot_usdt = {
-        s["symbol"]: s
-        for s in symbols
+        s["symbol"]: s for s in symbols
         if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT" and s.get("isSpotTradingAllowed")
     }
-
-    # 24h ticker stats (volume ranking)
-    tickers = http_get(f"{BINANCE_API}/ticker/24hr").json()
+    # 24h tickers to rank by quote volume (USDT ~ USD)
+    tickers = binance_get("/api/v3/ticker/24hr")
     rows = []
     for t in tickers:
         sym = t.get("symbol")
         if sym in spot_usdt:
-            try:
-                qvol = float(t.get("quoteVolume", "0"))  # USD-ish since quote is USDT
-            except:
-                qvol = 0.0
+            qvol = float(t.get("quoteVolume") or 0.0)
             rows.append((sym, spot_usdt[sym]["baseAsset"], qvol))
-    df = pd.DataFrame(rows, columns=["symbol", "base", "quoteVolume"]).sort_values("quoteVolume", ascending=False)
-    # take top_n unique base assets (avoid multiple markets for same base)
-    seen = set()
-    selected = []
+    df = pd.DataFrame(rows, columns=["symbol","base","quoteVolume"]).sort_values("quoteVolume", ascending=False)
+    # unique bases (avoid multiple markets for same coin)
+    seen, selected = set(), []
     for _, r in df.iterrows():
-        base = r["base"]
-        if base in seen:
+        b = r["base"]
+        if b in seen: 
             continue
-        seen.add(base)
-        selected.append((r["symbol"], base))
+        seen.add(b)
+        selected.append((r["symbol"], b))
         if len(selected) == top_n:
             break
-    return selected  # list of (symbol, base)
+    return selected  # [(symbol, base)]
 
-# ---------- HISTORY: daily klines for a symbol ----------
 @st.cache_data(show_spinner=False, ttl=60*60*6)
-def fetch_daily_close(symbol: str, limit: int = 500) -> pd.Series | None:
-    # 1d candles, up to 1000 max; limit=500 ~ 1.4 years
-    r = http_get(f"{BINANCE_API}/klines", params={"symbol": symbol, "interval": "1d", "limit": limit})
-    arr = r.json()
+def fetch_daily_close(symbol: str, limit: int = 360) -> pd.Series | None:
+    # 1d candles, limit up to 1000
+    arr = binance_get("/api/v3/klines", params={"symbol": symbol, "interval": "1d", "limit": limit})
     if not arr:
         return None
     df = pd.DataFrame(arr, columns=[
@@ -62,17 +81,14 @@ def fetch_daily_close(symbol: str, limit: int = 500) -> pd.Series | None:
     ])
     ts = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
     px = pd.to_numeric(df["close"], errors="coerce").astype(float)
-    s = pd.Series(px.values, index=ts)
-    s.name = symbol
-    # sanitize
+    s = pd.Series(px.values, index=ts).sort_index()
     s = s.replace([np.inf, -np.inf], np.nan)
     s[s <= 0] = np.nan
+    s.name = symbol
     return s
 
-# ---------- CORRELATIONS ----------
 def pairwise_corr(df: pd.DataFrame, min_overlap: int) -> pd.DataFrame:
-    cols = list(df.columns)
-    n = len(cols)
+    cols = list(df.columns); n = len(cols)
     out = np.full((n, n), np.nan, dtype=float)
     for i in range(n):
         out[i, i] = 1.0
@@ -86,7 +102,8 @@ def pairwise_corr(df: pd.DataFrame, min_overlap: int) -> pd.DataFrame:
                 ca = a - a.mean(); cb = b - b.mean()
                 denom = (np.sqrt((ca*ca).sum()) * np.sqrt((cb*cb).sum()))
                 if denom > 0:
-                    out[i, j] = out[j, i] = float((ca*cb).sum() / denom)
+                    rho = float((ca*cb).sum() / denom)
+                    out[i, j] = out[j, i] = rho
     return pd.DataFrame(out, index=cols, columns=cols)
 
 def render_heatmap(M: pd.DataFrame, title: str, key: str):
@@ -112,36 +129,36 @@ def top_pairs(C: pd.DataFrame, k=30) -> pd.DataFrame:
     if not pairs: return pd.DataFrame(columns=["A","B","|rho|","rho"])
     return pd.DataFrame(pairs, columns=["A","B","|rho|","rho"]).sort_values("|rho|", ascending=False).head(k)
 
-# ---------- SIDEBAR ----------
+# -------- Sidebar --------
 with st.sidebar:
     st.title("Controls")
-    top_n        = st.select_slider("Universe size (by 24h volume)", options=[25, 50, 75, 100], value=100)
+    top_n        = st.select_slider("Universe size (24h volume, USDT spot)", options=[25, 50, 75, 100], value=100)
     hist_limit   = st.select_slider("History (days)", options=[120, 240, 360, 500], value=360)
     corr_win_s   = st.selectbox("Correlation lookback", ["30D", "60D", "90D"], index=1)
     vol_roll_s   = st.selectbox("Volatility roll window", ["7", "14", "30"], index=2)
     min_overlap  = st.slider("Min overlap (days) per pair", 5, 60, 20, step=5)
     topk         = st.slider("Top pairs to show", 10, 100, 30, step=5)
 
-st.caption("Source: Binance public API (free). Universe = top USDT spot pairs by 24h volume. Returns = log(close).diff(); Vol = rolling σ × √365. Correlations use pairwise overlap with a minimum-days threshold.")
+st.caption("Source: Binance public API (free). If the default endpoint is blocked, the app auto-rotates to alternate bases. Returns = log(close).diff(); Vol = rolling σ × √365. Correlations use pairwise overlap.")
 
-# ---------- UNIVERSE ----------
+# -------- Universe --------
 universe = get_universe_from_binance(top_n=top_n)
 bases = [b for _, b in universe]
-st.write(f"Universe: {len(universe)} assets (USDT pairs) — examples: {', '.join(bases[:10])}…")
+st.write(f"Universe: {len(universe)} assets (USDT pairs). Examples: {', '.join(bases[:10])}…")
 
-# ---------- PRICES ----------
+# -------- Prices --------
 progress = st.progress(0)
 series = {}
 for i, (sym, base) in enumerate(universe):
     s = fetch_daily_close(sym, limit=hist_limit)
     if s is not None:
-        s.name = base  # label by base asset, e.g., BTC, ETH
+        s.name = base
         series[base] = s
     progress.progress((i+1)/len(universe))
-    time.sleep(0.03)  # polite; cached after first run
+    time.sleep(0.02)  # polite; cached
 
 if not series:
-    st.error("No price series fetched from Binance.")
+    st.error("No price series fetched from Binance. If you keep seeing this, your host is likely blocking all Binance bases. Run locally instead.")
     st.stop()
 
 prices = pd.concat(series, axis=1).sort_index()
@@ -149,10 +166,8 @@ prices = prices.replace([np.inf, -np.inf], np.nan)
 prices[prices <= 0] = np.nan
 st.write(f"Prices loaded for {prices.shape[1]} assets, {prices.shape[0]} daily rows.")
 
-# ---------- RETURNS & VOL ----------
+# -------- Returns & Vol --------
 rets_full = np.log(prices).diff()
-
-# Choose end date = last available across the panel
 end_date = rets_full.dropna(how="all").index.max()
 corr_win = {"30D":30, "60D":60, "90D":90}[corr_win_s]
 roll_w   = int(vol_roll_s)
@@ -161,28 +176,24 @@ rets = rets_full.loc[:end_date].tail(corr_win)
 rv   = rets_full.rolling(roll_w, min_periods=max(2, roll_w//2)).std() * math.sqrt(365)
 rv   = rv.loc[:end_date].tail(corr_win)
 
-# Drop zero-variance columns in-window
 def drop_dead(M: pd.DataFrame, min_non_null=3):
     if M is None or M.empty: return M
     M = M.loc[:, M.count() >= min_non_null]
     M = M.loc[:, M.std(skipna=True) > 0]
     return M
 
-rets, rv = drop_dead(rets), drop_dead(rv)
+rets = drop_dead(rets); rv = drop_dead(rv)
 
-# ---------- CORRELATIONS (pairwise, min overlap) ----------
+# -------- Correlations --------
 corr_price = pairwise_corr(rets, min_overlap=min_overlap)
 corr_vol   = pairwise_corr(rv,   min_overlap=min_overlap)
-
 st.write(f"Corr shapes → price: {corr_price.shape}, vol: {corr_vol.shape}")
 
-# ---------- PREVIEW ----------
-st.write("Price corr (top-left 5×5)")
-st.dataframe(corr_price.iloc[:5,:5].round(3), use_container_width=True)
-st.write("Vol corr (top-left 5×5)")
-st.dataframe(corr_vol.iloc[:5,:5].round(3),   use_container_width=True)
+# -------- Preview --------
+st.write("Price corr (top-left 5×5)"); st.dataframe(corr_price.iloc[:5,:5].round(3), use_container_width=True)
+st.write("Vol corr (top-left 5×5)");   st.dataframe(corr_vol.iloc[:5,:5].round(3),   use_container_width=True)
 
-# ---------- HEATMAPS + TOP PAIRS ----------
+# -------- Heatmaps + Top pairs --------
 col1, col2 = st.columns(2)
 with col1:
     render_heatmap(corr_price, f"Price correlation — last {corr_win_s}", "price_corr_chart")
